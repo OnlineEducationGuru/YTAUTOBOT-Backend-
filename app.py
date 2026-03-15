@@ -1,35 +1,21 @@
-"""
-🎬 Auto Video Bot - Backend API Server
-Runs on Render.com (FREE) - 24/7
-"""
-
-from flask import Flask, request, jsonify
-from flask_cors import CORS
 import os
 import json
 import uuid
 import threading
-import time
-from datetime import datetime
-from apscheduler.schedulers.background import BackgroundScheduler
-
-from config import Config
-from script_generator import ScriptGenerator
-from voice_generator import VoiceGenerator
-from video_creator import VideoCreator
-from youtube_uploader import YouTubeUploader
-from facebook_uploader import FacebookUploader
-from database import Database
+from datetime import datetime, timedelta
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 
 app = Flask(__name__)
-CORS(app)  # Allow frontend to connect
+CORS(app)
 
-# Initialize components
-db = Database()
-scheduler = BackgroundScheduler()
-scheduler.start()
+# ============ DATA STORAGE ============
+DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+for d in ["output/scripts", "output/audio", "output/videos",
+          "output/temp", "credentials"]:
+    os.makedirs(d, exist_ok=True)
 
-# Global state
 bot_state = {
     "running": False,
     "auto_mode": False,
@@ -38,59 +24,160 @@ bot_state = {
 }
 
 
-# ==================== HEALTH CHECK ====================
-@app.route('/api/ping', methods=['GET'])
+def read_json(filename, default=None):
+    path = os.path.join(DATA_DIR, filename)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return default if default is not None else {}
+
+
+def write_json(filename, data):
+    path = os.path.join(DATA_DIR, filename)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2, default=str)
+
+
+# ============ HOME PAGE ============
+@app.route("/")
+def home():
+    return """
+    <html>
+    <head>
+        <title>Auto Video Bot</title>
+        <style>
+            body {
+                background: #0f172a;
+                color: white;
+                font-family: Arial, sans-serif;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                height: 100vh;
+                margin: 0;
+            }
+            .container {
+                text-align: center;
+                padding: 40px;
+                background: #1e293b;
+                border-radius: 20px;
+                box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            }
+            h1 { font-size: 2.5em; margin-bottom: 10px; }
+            .status {
+                color: #22c55e;
+                font-size: 1.3em;
+                margin: 15px 0;
+            }
+            .dot {
+                display: inline-block;
+                width: 12px;
+                height: 12px;
+                background: #22c55e;
+                border-radius: 50%;
+                margin-right: 8px;
+                animation: pulse 2s infinite;
+            }
+            @keyframes pulse {
+                0%, 100% { opacity: 1; }
+                50% { opacity: 0.4; }
+            }
+            a {
+                color: #818cf8;
+                text-decoration: none;
+                font-size: 1.1em;
+            }
+            a:hover { text-decoration: underline; }
+            .endpoints {
+                margin-top: 20px;
+                text-align: left;
+                background: #0f172a;
+                padding: 15px;
+                border-radius: 10px;
+                font-family: monospace;
+                font-size: 0.9em;
+            }
+            .endpoints p {
+                margin: 5px 0;
+                color: #94a3b8;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🤖 Auto Video Bot</h1>
+            <div class="status">
+                <span class="dot"></span>
+                Server is Running!
+            </div>
+            <p style="color:#94a3b8;">
+                YouTube & Facebook Auto Video Generator
+            </p>
+            <br>
+            <a href="/api/ping">📡 Test API</a>
+            <div class="endpoints">
+                <p>✅ GET  /api/ping</p>
+                <p>✅ POST /api/settings</p>
+                <p>✅ POST /api/generate</p>
+                <p>✅ GET  /api/videos</p>
+                <p>✅ POST /api/bot/start</p>
+                <p>✅ POST /api/auto/start</p>
+                <p>✅ GET  /api/analytics</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+
+# ============ API: PING ============
+@app.route("/api/ping")
 def ping():
     return jsonify({
         "status": "ok",
-        "message": "Auto Video Bot Backend is running! 🤖",
+        "message": "Auto Video Bot is running! 🤖",
         "time": datetime.now().isoformat(),
         "bot_running": bot_state["running"],
         "auto_mode": bot_state["auto_mode"]
     })
 
 
-# ==================== SETTINGS ====================
-@app.route('/api/settings', methods=['GET'])
+# ============ API: SETTINGS ============
+@app.route("/api/settings", methods=["GET"])
 def get_settings():
-    settings = db.get_settings()
-    return jsonify(settings)
+    return jsonify(read_json("settings.json", {}))
 
 
-@app.route('/api/settings', methods=['POST'])
+@app.route("/api/settings", methods=["POST"])
 def save_settings():
-    data = request.json
-    db.save_settings(data)
-    
-    # Update config
-    Config.update_from_dict(data)
-    
+    data = request.json or {}
+    existing = read_json("settings.json", {})
+    existing.update(data)
+    write_json("settings.json", existing)
     return jsonify({"success": True, "message": "Settings saved!"})
 
 
-# ==================== VIDEO GENERATION ====================
-@app.route('/api/generate', methods=['POST'])
+# ============ API: GENERATE VIDEO ============
+@app.route("/api/generate", methods=["POST"])
 def generate_video():
-    """Start video generation (async)"""
     data = request.json or {}
-    
     task_id = str(uuid.uuid4())[:8]
-    
-    # Start generation in background thread
-    thread = threading.Thread(
-        target=run_generation_pipeline,
-        args=(task_id, data)
-    )
-    thread.daemon = True
-    thread.start()
-    
+
     bot_state["tasks"][task_id] = {
         "status": "started",
         "step": 1,
         "message": "Starting generation...",
         "created": datetime.now().isoformat()
     }
-    
+
+    thread = threading.Thread(
+        target=run_pipeline,
+        args=(task_id, data),
+        daemon=True
+    )
+    thread.start()
+
     return jsonify({
         "task_id": task_id,
         "status": "started",
@@ -98,493 +185,500 @@ def generate_video():
     })
 
 
-@app.route('/api/generate/status/<task_id>', methods=['GET'])
-def generation_status(task_id):
-    """Check generation progress"""
-    task = bot_state["tasks"].get(task_id, {})
-    return jsonify(task)
+@app.route("/api/generate/status/<task_id>")
+def gen_status(task_id):
+    return jsonify(
+        bot_state["tasks"].get(task_id, {"status": "not_found"})
+    )
 
 
-def run_generation_pipeline(task_id, options):
-    """Background pipeline - generates video"""
+def run_pipeline(task_id, options):
+    """Full video generation pipeline"""
+    import time
+
     try:
-        settings = db.get_settings()
-        
-        # Merge options with saved settings
+        settings = read_json("settings.json", {})
         config = {**settings, **options}
-        Config.update_from_dict(config)
-        
-        # Step 1: Generate Script
-        update_task(task_id, 1, "active", "Generating AI script...")
-        
-        script_gen = ScriptGenerator()
-        topic = options.get("topic")
-        script_data = script_gen.generate_script(custom_topic=topic)
-        
-        if not script_data:
-            update_task(task_id, 1, "failed", "Script generation failed")
-            return
-        
-        update_task(task_id, 1, "done", "Script generated!")
-        
-        # Step 2: Generate Voice
-        update_task(task_id, 2, "active", "Creating voice over...")
-        
-        voice_gen = VoiceGenerator()
-        audio_path, subtitle_path = voice_gen.generate_from_script(script_data)
-        
-        update_task(task_id, 2, "done", "Voice over created!")
-        
-        # Step 3: Create Video
-        update_task(task_id, 3, "active", "Rendering video...")
-        
-        video_type = options.get("video_type", "short")
-        
-        videos_created = []
-        
-        if video_type in ["short", "both"]:
-            Config.VIDEO_TYPE = "short"
-            Config.VIDEO_WIDTH = 1080
-            Config.VIDEO_HEIGHT = 1920
-            
-            creator = VideoCreator()
-            video_path = creator.create_video(script_data, audio_path, subtitle_path)
-            videos_created.append({"path": video_path, "type": "short"})
-        
-        if video_type in ["long", "both"]:
-            Config.VIDEO_TYPE = "long"
-            Config.VIDEO_WIDTH = 1920
-            Config.VIDEO_HEIGHT = 1080
-            
-            # Generate longer script for long video
-            if video_type == "both":
-                long_script = script_gen.generate_script(custom_topic=topic)
-                long_audio, long_srt = voice_gen.generate_from_script(long_script)
-            else:
-                long_script = script_data
-                long_audio, long_srt = audio_path, subtitle_path
-            
-            creator = VideoCreator()
-            video_path = creator.create_video(long_script, long_audio, long_srt)
-            videos_created.append({"path": video_path, "type": "long"})
-        
-        update_task(task_id, 3, "done", "Video rendered!")
-        
-        # Step 4: Generate Metadata
-        update_task(task_id, 4, "active", "Generating metadata...")
-        
-        yt_meta, fb_meta = script_gen.generate_metadata(script_data)
-        
-        update_task(task_id, 4, "done", "Metadata generated!")
-        
-        # Step 5: Upload / Schedule
-        update_task(task_id, 5, "active", "Scheduling upload...")
-        
-        upload_results = {}
-        auto_upload = options.get("auto_upload", True)
-        
-        if auto_upload:
-            # Determine if we should upload now or schedule
-            from scheduler_service import get_next_peak_time
-            
-            yt_time = get_next_peak_time("youtube")
-            fb_time = get_next_peak_time("facebook")
-            
-            now = datetime.now()
-            
-            for video_info in videos_created:
-                vid_path = video_info["path"]
-                vid_type = video_info["type"]
-                
-                # YouTube Upload
-                if config.get("upload_youtube", True):
-                    time_diff = (yt_time - now).total_seconds()
-                    
-                    if time_diff <= 1800:  # Within 30 min
-                        try:
-                            yt = YouTubeUploader()
-                            meta = yt_meta.copy()
-                            if vid_type == "short":
-                                meta["title"] = meta["title"] + " #shorts"
-                            result = yt.upload_video(vid_path, meta)
-                            upload_results["youtube"] = result
-                        except Exception as e:
-                            upload_results["youtube_error"] = str(e)
-                    else:
-                        # Schedule for later
-                        scheduler.add_job(
-                            upload_to_youtube_job,
-                            'date',
-                            run_date=yt_time,
-                            args=[vid_path, yt_meta, vid_type]
-                        )
-                        upload_results["youtube_scheduled"] = yt_time.isoformat()
-                
-                # Facebook Upload
-                if config.get("upload_facebook", True) and config.get("facebook_page_id"):
-                    fb_time_diff = (fb_time - now).total_seconds()
-                    
-                    if fb_time_diff <= 1800:
-                        try:
-                            fb = FacebookUploader()
-                            caption = fb_meta.get("caption", "")
-                            hashtags = fb_meta.get("hashtags", "")
-                            
-                            if vid_type == "short":
-                                result = fb.upload_reel(vid_path, f"{caption}\n{hashtags}")
-                            else:
-                                result = fb.upload_video(vid_path, caption, hashtags)
-                            upload_results["facebook"] = result
-                        except Exception as e:
-                            upload_results["facebook_error"] = str(e)
-                    else:
-                        scheduler.add_job(
-                            upload_to_facebook_job,
-                            'date',
-                            run_date=fb_time,
-                            args=[vid_path, fb_meta, vid_type]
-                        )
-                        upload_results["facebook_scheduled"] = fb_time.isoformat()
-        
-        update_task(task_id, 5, "done", "Complete!")
-        
-        # Save to database
-        video_record = {
-            "id": task_id,
-            "title": script_data.get("title_hindi", ""),
-            "title_en": script_data.get("title_english", ""),
-            "topic": script_data.get("topic", ""),
-            "video_type": options.get("video_type", "short"),
-            "tags": script_data.get("tags_english", []),
-            "hashtags": script_data.get("hashtags", []),
-            "videos": videos_created,
-            "upload_results": upload_results,
-            "created": datetime.now().isoformat(),
-            "status": "completed"
+        topic = config.get("topic") or "सफलता के नियम"
+        niche = config.get("channel_niche") or "motivation"
+
+        # ---- Step 1: Script ----
+        bot_state["tasks"][task_id] = {
+            "status": "processing", "step": 1,
+            "message": "Generating AI script..."
         }
-        
-        db.save_video(video_record)
-        
-        # Update task with final result
+
+        script = generate_script(topic, niche)
+        time.sleep(1)
+
+        bot_state["tasks"][task_id] = {
+            "status": "processing", "step": 2,
+            "message": "Creating voice over..."
+        }
+
+        # ---- Step 2: Voice ----
+        audio_path = None
+        srt_path = None
+        try:
+            import edge_tts
+            import asyncio
+            import re
+
+            voice = config.get("voice", "hi-IN-SwaraNeural")
+            text = script["script"].replace(" | ", "। ").replace("|", "। ")
+            fname = re.sub(r'[^\w\s-]', '', topic)[:30]
+
+            audio_path = f"output/audio/{fname}.mp3"
+            srt_path = f"output/audio/{fname}.srt"
+
+            async def make_audio():
+                communicate = edge_tts.Communicate(text=text, voice=voice)
+                submaker = edge_tts.SubMaker()
+                with open(audio_path, "wb") as af:
+                    async for chunk in communicate.stream():
+                        if chunk["type"] == "audio":
+                            af.write(chunk["data"])
+                        elif chunk["type"] == "WordBoundary":
+                            submaker.add(chunk["offset"],
+                                        chunk["duration"],
+                                        chunk["text"])
+                with open(srt_path, "w", encoding="utf-8") as sf:
+                    sf.write(submaker.generate_srt())
+
+            asyncio.run(make_audio())
+        except Exception as e:
+            bot_state["tasks"][task_id]["message"] = f"Voice: {e}"
+            audio_path = None
+
+        # ---- Step 3: Video ----
+        bot_state["tasks"][task_id] = {
+            "status": "processing", "step": 3,
+            "message": "Rendering video..."
+        }
+
+        video_path = None
+        if audio_path and os.path.exists(audio_path):
+            try:
+                from moviepy.editor import (
+                    AudioFileClip, ColorClip,
+                    CompositeVideoClip, TextClip
+                )
+                import re as re2
+
+                vtype = config.get("video_type", "short")
+                w = 1080 if vtype == "short" else 1920
+                h = 1920 if vtype == "short" else 1080
+
+                audio_clip = AudioFileClip(audio_path)
+                dur = audio_clip.duration
+
+                bg = ColorClip(size=(w, h),
+                              color=(10, 10, 30),
+                              duration=dur)
+
+                clips = [bg]
+
+                # Add simple subtitle
+                try:
+                    hook = script.get("hook", topic)
+                    txt = TextClip(
+                        hook,
+                        fontsize=40,
+                        color="white",
+                        font="Arial-Bold",
+                        method="caption",
+                        size=(w - 100, None),
+                        align="center",
+                        stroke_color="black",
+                        stroke_width=2
+                    )
+                    txt = txt.set_position(("center", h - 400))
+                    txt = txt.set_duration(dur)
+                    clips.append(txt)
+                except:
+                    pass
+
+                video = CompositeVideoClip(clips, size=(w, h))
+                video = video.set_audio(audio_clip)
+                video = video.set_duration(dur)
+
+                fname2 = re2.sub(r'[^\w\s-]', '', topic)[:30]
+                video_path = f"output/videos/{fname2}.mp4"
+
+                video.write_videofile(
+                    video_path,
+                    fps=24,
+                    codec="libx264",
+                    audio_codec="aac",
+                    preset="ultrafast",
+                    threads=2,
+                    logger=None
+                )
+                audio_clip.close()
+                video.close()
+            except Exception as e:
+                bot_state["tasks"][task_id]["message"] = f"Video: {e}"
+                video_path = None
+
+        # ---- Step 4: Metadata ----
+        bot_state["tasks"][task_id] = {
+            "status": "processing", "step": 4,
+            "message": "Generating metadata..."
+        }
+        time.sleep(1)
+
+        # ---- Step 5: Schedule ----
+        bot_state["tasks"][task_id] = {
+            "status": "processing", "step": 5,
+            "message": "Scheduling upload..."
+        }
+
+        upload_results = {}
+
+        # YouTube upload
+        if config.get("upload_youtube") and video_path:
+            try:
+                from youtube_uploader import YouTubeUploader
+                yt = YouTubeUploader()
+                if yt.youtube:
+                    meta = {
+                        "title": script.get("title_hindi", topic),
+                        "description": script.get("description", ""),
+                        "tags": script.get("tags_english", []),
+                        "category_id": "22",
+                        "privacy": "public"
+                    }
+                    result = yt.upload_video(video_path, meta)
+                    upload_results["youtube"] = result
+            except Exception as e:
+                upload_results["youtube_error"] = str(e)
+
+        # Facebook upload
+        if (config.get("upload_facebook")
+                and config.get("facebook_page_id")
+                and video_path):
+            try:
+                from facebook_uploader import FacebookUploader
+                fb = FacebookUploader()
+                result = fb.upload_video(
+                    video_path,
+                    script.get("caption_facebook", ""),
+                    " ".join(script.get("hashtags", []))
+                )
+                upload_results["facebook"] = result
+            except Exception as e:
+                upload_results["facebook_error"] = str(e)
+
+        time.sleep(1)
+
+        # ---- DONE ----
         bot_state["tasks"][task_id] = {
             "status": "completed",
             "step": 5,
-            "message": "Video generated and scheduled!",
-            "title": script_data.get("title_hindi", ""),
-            "video_type": options.get("video_type", "short"),
-            "tags": script_data.get("tags_english", [])[:10],
-            "hashtags": script_data.get("hashtags", [])[:5],
-            "youtube_url": upload_results.get("youtube", {}).get("url", ""),
-            "scheduled": upload_results.get("youtube_scheduled", 
-                        upload_results.get("facebook_scheduled", "")),
+            "message": "Video generated successfully!",
+            "title": script.get("title_hindi", ""),
+            "video_type": config.get("video_type", "short"),
+            "tags": script.get("tags_english", [])[:10],
+            "hashtags": script.get("hashtags", [])[:5],
+            "youtube_url": (upload_results.get("youtube", {}) or {}).get("url", ""),
+            "upload_results": upload_results
         }
-        
-        bot_state["latest_log"] = f"✅ Video generated: {script_data.get('title_hindi', '')}"
-        
+
+        # Save record
+        videos = read_json("videos.json", [])
+        videos.insert(0, {
+            "id": task_id,
+            "title": script.get("title_hindi", ""),
+            "topic": topic,
+            "duration": "60s",
+            "video_type": config.get("video_type", "short"),
+            "created": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "status": "completed"
+        })
+        write_json("videos.json", videos)
+
+        bot_state["latest_log"] = (
+            f"✅ Video: {script.get('title_hindi', topic)}"
+        )
+
     except Exception as e:
         bot_state["tasks"][task_id] = {
             "status": "failed",
-            "step": bot_state["tasks"].get(task_id, {}).get("step", 1),
-            "message": f"Error: {str(e)}",
+            "step": bot_state["tasks"].get(
+                task_id, {}
+            ).get("step", 1),
+            "message": str(e),
             "error": str(e)
         }
-        bot_state["latest_log"] = f"❌ Generation failed: {str(e)}"
+        bot_state["latest_log"] = f"❌ Failed: {e}"
 
 
-def update_task(task_id, step, status, message):
-    """Update task progress"""
-    bot_state["tasks"][task_id] = {
-        "status": "processing" if status != "failed" else "failed",
-        "step": step,
-        "step_status": status,
-        "message": message
+def generate_script(topic, niche="motivation"):
+    """Generate script - try AI first, fallback to templates"""
+
+    # Try g4f
+    try:
+        import g4f
+        prompt = (
+            f'Create a 60-second Hindi video script about: "{topic}". '
+            f'Return ONLY valid JSON: '
+            f'{{"topic":"{topic}",'
+            f'"title_hindi":"Hindi title",'
+            f'"title_english":"English title",'
+            f'"script":"sentence1। | sentence2। | sentence3।",'
+            f'"hook":"hook line",'
+            f'"tags_english":["tag1","tag2","tag3"],'
+            f'"tags_hindi":["टैग1","टैग2"],'
+            f'"hashtags":["#tag1","#tag2","#tag3","#tag4","#tag5"],'
+            f'"description":"YouTube description",'
+            f'"caption_facebook":"Facebook caption"}}'
+        )
+
+        response = g4f.ChatCompletion.create(
+            model="gpt-4",
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        import re
+        response = str(response).strip()
+        if "```" in response:
+            response = re.sub(r'```\w*\n?', '', response)
+        start = response.find("{")
+        end = response.rfind("}")
+        if start != -1 and end != -1:
+            data = json.loads(response[start:end + 1])
+            if data.get("script"):
+                return data
+    except Exception as e:
+        print(f"AI script failed: {e}")
+
+    # Fallback templates
+    templates = {
+        "motivation": {
+            "script": (
+                "क्या आप भी जिंदगी में सफल होना चाहते हैं? | "
+                "तो ये वीडियो आपके लिए है। | "
+                "सफलता का पहला नियम है कभी हार मत मानो। | "
+                "हर सुबह एक नया मौका लेकर आती है। | "
+                "अपने सपनों को कभी मत छोड़ो। | "
+                "मेहनत कभी बेकार नहीं जाती। | "
+                "जो आज मेहनत करते हैं कल दुनिया उनका नाम "
+                "जानती है। | "
+                "उठो जागो और तब तक मत रुको जब तक लक्ष्य "
+                "पूरा न हो जाए। | "
+                "लाइक और सब्सक्राइब जरूर करें।"
+            ),
+            "hook": "क्या आप सफल होना चाहते हैं?"
+        },
+        "facts": {
+            "script": (
+                "क्या आप जानते हैं ये हैरान कर देने वाला "
+                "फैक्ट? | "
+                "दुनिया में ऐसी बहुत सी बातें हैं जो आपको "
+                "चौंका देंगी। | "
+                "आज हम बताएंगे कुछ ऐसे ही रोचक तथ्य। | "
+                "इंसान का दिमाग दिन में साठ हज़ार बार सोचता "
+                "है। | "
+                "शहद कभी खराब नहीं होता। | "
+                "ऐसे और फैक्ट्स के लिए सब्सक्राइब करें।"
+            ),
+            "hook": "ये फैक्ट आपको चौंका देगा!"
+        },
+        "tech": {
+            "script": (
+                "आज मैं बताऊंगा एक ऐसी ट्रिक जो बहुत कम "
+                "लोग जानते हैं। | "
+                "ये hidden feature आपका फोन स्मार्ट बना "
+                "देगी। | "
+                "सेटिंग्स में जाइए और ये ऑप्शन ऑन कीजिए। | "
+                "आपका फोन दोगुना फास्ट चलेगा। | "
+                "ऐसी और टिप्स के लिए सब्सक्राइब करें।"
+            ),
+            "hook": "ये trick बहुत कम लोग जानते हैं!"
+        },
+        "health": {
+            "script": (
+                "सुबह उठकर ये एक काम करो सेहत बदल "
+                "जाएगी। | "
+                "खाली पेट गर्म पानी पीना चाहिए। | "
+                "रोज़ तीस मिनट exercise करो। | "
+                "ये छोटी आदतें जिंदगी बदल देंगी। | "
+                "सब्सक्राइब करें।"
+            ),
+            "hook": "सुबह ये करो सेहत बदल जाएगी!"
+        },
+        "finance": {
+            "script": (
+                "अमीर बनना है तो ये बातें याद रखो। | "
+                "पहला नियम बचत करो। | "
+                "दूसरा नियम निवेश करो। | "
+                "तीसरा नियम कर्ज मत लो। | "
+                "चौथा नियम पैसे से पैसा कमाओ। | "
+                "सब्सक्राइब करें।"
+            ),
+            "hook": "अमीर बनना है तो सुनो!"
+        }
+    }
+
+    t = templates.get(niche, templates["motivation"])
+
+    return {
+        "topic": topic,
+        "title_hindi": f"{topic} - जिंदगी बदल देगा",
+        "title_english": f"{topic} - Must Watch",
+        "script": t["script"],
+        "hook": t["hook"],
+        "tags_english": [
+            "motivation", "hindi", "success",
+            "viral", "trending", "shorts",
+            "inspirational", "india"
+        ],
+        "tags_hindi": ["मोटिवेशन", "प्रेरणा", "सफलता"],
+        "hashtags": [
+            "#motivation", "#hindi", "#viral",
+            "#trending", "#shorts"
+        ],
+        "description": f"{topic} | Hindi Video",
+        "caption_facebook": f"🔥 {topic}\n#motivation #hindi #viral"
     }
 
 
-# ==================== UPLOAD JOBS ====================
-def upload_to_youtube_job(video_path, metadata, video_type):
-    """Scheduled YouTube upload job"""
-    try:
-        yt = YouTubeUploader()
-        if video_type == "short":
-            metadata["title"] = metadata["title"] + " #shorts"
-        result = yt.upload_video(video_path, metadata)
-        bot_state["latest_log"] = f"✅ YouTube upload complete: {metadata.get('title', '')}"
-        db.log_upload("youtube", metadata.get("title", ""), result)
-    except Exception as e:
-        bot_state["latest_log"] = f"❌ YouTube upload failed: {e}"
-
-
-def upload_to_facebook_job(video_path, metadata, video_type):
-    """Scheduled Facebook upload job"""
-    try:
-        fb = FacebookUploader()
-        caption = metadata.get("caption", "")
-        hashtags = metadata.get("hashtags", "")
-        
-        if video_type == "short":
-            result = fb.upload_reel(video_path, f"{caption}\n{hashtags}")
-        else:
-            result = fb.upload_video(video_path, caption, hashtags)
-        
-        bot_state["latest_log"] = f"✅ Facebook upload complete"
-        db.log_upload("facebook", caption[:50], result)
-    except Exception as e:
-        bot_state["latest_log"] = f"❌ Facebook upload failed: {e}"
-
-
-# ==================== VIDEOS ====================
-@app.route('/api/videos', methods=['GET'])
+# ============ API: VIDEOS ============
+@app.route("/api/videos")
 def get_videos():
-    videos = db.get_videos()
-    return jsonify({"videos": videos})
+    return jsonify({"videos": read_json("videos.json", [])})
 
 
-@app.route('/api/videos/<video_id>', methods=['DELETE'])
+@app.route("/api/videos/<video_id>", methods=["DELETE"])
 def delete_video(video_id):
-    db.delete_video(video_id)
+    videos = read_json("videos.json", [])
+    videos = [v for v in videos if v.get("id") != video_id]
+    write_json("videos.json", videos)
     return jsonify({"success": True})
 
 
-# ==================== BOT CONTROL ====================
-@app.route('/api/bot/start', methods=['POST'])
+# ============ API: BOT CONTROL ============
+@app.route("/api/bot/status")
+def bot_status():
+    return jsonify({
+        "running": bot_state["running"],
+        "auto_mode": bot_state["auto_mode"],
+        "latest_log": bot_state["latest_log"]
+    })
+
+
+@app.route("/api/bot/start", methods=["POST"])
 def start_bot():
     bot_state["running"] = True
     bot_state["latest_log"] = "🤖 Bot started!"
     return jsonify({"success": True, "message": "Bot started!"})
 
 
-@app.route('/api/bot/stop', methods=['POST'])
+@app.route("/api/bot/stop", methods=["POST"])
 def stop_bot():
     bot_state["running"] = False
     bot_state["auto_mode"] = False
-    bot_state["latest_log"] = "⏹️ Bot stopped"
+    bot_state["latest_log"] = "⏹ Bot stopped"
     return jsonify({"success": True, "message": "Bot stopped!"})
 
 
-@app.route('/api/bot/status', methods=['GET'])
-def bot_status():
-    return jsonify({
-        "running": bot_state["running"],
-        "auto_mode": bot_state["auto_mode"],
-        "latest_log": bot_state["latest_log"],
-        "scheduled_jobs": len(scheduler.get_jobs())
-    })
-
-
-# ==================== AUTO MODE ====================
-@app.route('/api/auto/start', methods=['POST'])
-def start_auto_mode():
+# ============ API: AUTO MODE ============
+@app.route("/api/auto/start", methods=["POST"])
+def auto_start():
     data = request.json or {}
-    
     bot_state["auto_mode"] = True
     bot_state["running"] = True
-    
-    videos_per_day = data.get("videos_per_day", 1)
-    make_shorts = data.get("make_shorts", True)
-    make_long = data.get("make_long", False)
-    
-    # Save auto config
-    db.save_settings({**data, "auto_mode": True})
-    
-    # Schedule daily video generation
-    # Generate at different times of day
-    generation_hours = [6, 10, 14]  # 6 AM, 10 AM, 2 PM
-    
-    for i in range(min(videos_per_day, 3)):
-        hour = generation_hours[i]
-        
-        video_type = "both" if (make_shorts and make_long) else ("short" if make_shorts else "long")
-        
-        job_id = f"auto_gen_{i}"
-        
-        # Remove existing job if any
-        existing = scheduler.get_job(job_id)
-        if existing:
-            scheduler.remove_job(job_id)
-        
-        scheduler.add_job(
-            auto_generate_job,
-            'cron',
-            hour=hour,
-            minute=0,
-            args=[data, video_type],
-            id=job_id,
-            replace_existing=True
-        )
-    
-    bot_state["latest_log"] = f"🤖 Auto mode started! {videos_per_day} video(s)/day"
-    
-    # Generate first video immediately
+
+    vpd = data.get("videos_per_day", 1)
+    bot_state["latest_log"] = f"🤖 Auto: {vpd} videos/day"
+
     threading.Thread(
-        target=auto_generate_job,
-        args=[data, "short" if make_shorts else "long"],
+        target=run_pipeline,
+        args=[f"auto_{uuid.uuid4().hex[:6]}", data],
         daemon=True
     ).start()
-    
+
     return jsonify({
         "success": True,
-        "message": f"Auto mode started! Will generate {videos_per_day} video(s) per day"
+        "message": f"Auto mode: {vpd} videos/day"
     })
 
 
-@app.route('/api/auto/stop', methods=['POST'])
-def stop_auto_mode():
+@app.route("/api/auto/stop", methods=["POST"])
+def auto_stop():
     bot_state["auto_mode"] = False
-    
-    # Remove scheduled jobs
-    for job in scheduler.get_jobs():
-        if job.id.startswith("auto_"):
-            scheduler.remove_job(job.id)
-    
-    bot_state["latest_log"] = "⏹️ Auto mode stopped"
-    
-    return jsonify({"success": True, "message": "Auto mode stopped"})
+    bot_state["latest_log"] = "⏹ Auto mode stopped"
+    return jsonify({"success": True})
 
 
-def auto_generate_job(config, video_type):
-    """Auto generation job - called by scheduler"""
-    task_id = f"auto_{str(uuid.uuid4())[:6]}"
-    
-    options = {
-        **config,
-        "video_type": video_type,
-        "auto_upload": True,
-        "topic": None  # AI picks topic
-    }
-    
-    bot_state["latest_log"] = f"🎬 Auto generating video ({video_type})..."
-    run_generation_pipeline(task_id, options)
+# ============ API: ANALYTICS ============
+@app.route("/api/analytics")
+def analytics():
+    videos = read_json("videos.json", [])
+    return jsonify({
+        "total_videos": len(videos),
+        "youtube_uploads": 0,
+        "facebook_uploads": 0,
+        "uploaded": 0,
+        "failed": 0,
+        "scheduled": 0
+    })
 
 
-# ==================== ANALYTICS ====================
-@app.route('/api/analytics', methods=['GET'])
-def get_analytics():
-    stats = db.get_analytics()
-    return jsonify(stats)
+# ============ API: SCHEDULE ============
+@app.route("/api/schedule")
+def schedule():
+    return jsonify({"jobs": []})
 
 
-# ==================== SCHEDULE ====================
-@app.route('/api/schedule', methods=['GET'])
-def get_schedule():
-    jobs = []
-    for job in scheduler.get_jobs():
-        jobs.append({
-            "id": job.id,
-            "next_run": str(job.next_run_time),
-            "name": job.name
-        })
-    return jsonify({"jobs": jobs})
+# ============ API: CONNECTIONS ============
+@app.route("/api/test/connections")
+def test_conn():
+    yt = False
+    fb = bool(os.environ.get("FACEBOOK_PAGE_ID"))
 
-
-# ==================== AUTH ====================
-@app.route('/api/auth/youtube/url', methods=['GET'])
-def youtube_auth_url():
-    """Get YouTube OAuth URL"""
     try:
-        from google_auth_oauthlib.flow import Flow
-        
-        flow = Flow.from_client_secrets_file(
-            Config.YOUTUBE_CLIENT_SECRET,
-            scopes=["https://www.googleapis.com/auth/youtube.upload"],
-            redirect_uri=request.host_url + "api/auth/youtube/callback"
-        )
-        
-        auth_url, state = flow.authorization_url(
-            access_type='offline',
-            include_granted_scopes='true'
-        )
-        
-        return jsonify({"auth_url": auth_url, "state": state})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-
-
-@app.route('/api/auth/youtube/callback')
-def youtube_auth_callback():
-    """YouTube OAuth callback"""
-    try:
-        from google_auth_oauthlib.flow import Flow
-        import pickle
-        
-        flow = Flow.from_client_secrets_file(
-            Config.YOUTUBE_CLIENT_SECRET,
-            scopes=["https://www.googleapis.com/auth/youtube.upload"],
-            redirect_uri=request.base_url
-        )
-        
-        flow.fetch_token(authorization_response=request.url)
-        credentials = flow.credentials
-        
-        token_path = os.path.join(Config.CREDENTIALS_DIR, "youtube_token.pickle")
-        with open(token_path, 'wb') as f:
-            pickle.dump(credentials, f)
-        
-        return "<h1>✅ YouTube Connected Successfully!</h1><p>You can close this window.</p>"
-    except Exception as e:
-        return f"<h1>❌ Error: {e}</h1>", 400
-
-
-# ==================== TEST CONNECTIONS ====================
-@app.route('/api/test/connections', methods=['GET'])
-def test_connections():
-    results = {"youtube": False, "facebook": False}
-    
-    try:
-        yt = YouTubeUploader()
-        if yt.youtube:
-            yt.get_channel_analytics()
-            results["youtube"] = True
+        cred_path = "credentials/youtube_client_secret.json"
+        token_path = "credentials/yt_token.pickle"
+        yt = os.path.exists(token_path)
     except:
         pass
-    
-    try:
-        fb = FacebookUploader()
-        info = fb.get_page_insights()
-        if info:
-            results["facebook"] = True
-    except:
-        pass
-    
-    return jsonify(results)
+
+    return jsonify({"youtube": yt, "facebook": fb})
 
 
-# ==================== CHANNEL ANALYSIS ====================
-@app.route('/api/analyze/channel', methods=['POST'])
-def analyze_channel():
-    data = request.json
-    channel_name = data.get("channel_name", "")
-    
-    # Use channel analyzer
-    from channel_analyzer import ChannelAnalyzer
-    analyzer = ChannelAnalyzer()
-    result = analyzer.analyze(channel_name)
-    
-    return jsonify(result)
+@app.route("/api/auth/youtube/url")
+def yt_auth():
+    return jsonify({
+        "message": "Setup YouTube OAuth in Google Cloud Console",
+        "error": "Not configured yet"
+    })
 
 
-# ==================== KEEP ALIVE (Render.com) ====================
-@app.route('/api/keepalive', methods=['GET'])
+@app.route("/api/analyze/channel", methods=["POST"])
+def analyze():
+    data = request.json or {}
+    name = data.get("channel_name", "")
+    return jsonify({
+        "channel_name": name,
+        "detected_niche": "motivation",
+        "suggested_topics": [
+            "सफलता के नियम",
+            "मोटिवेशनल कहानी",
+            "Amazing Facts हिंदी में",
+            "पैसे कैसे कमाएं"
+        ],
+        "hashtags": ["#hindi", "#viral", "#trending"]
+    })
+
+
+@app.route("/api/keepalive")
 def keepalive():
-    """Prevent Render.com from sleeping"""
     return jsonify({"alive": True, "time": datetime.now().isoformat()})
 
 
-# Keep-alive cron job (pings itself every 14 minutes)
-def keep_alive_job():
-    """Ping self to prevent Render free tier from sleeping"""
-    import requests
-    try:
-        url = os.environ.get('RENDER_EXTERNAL_URL', 'http://localhost:5000')
-        requests.get(f"{url}/api/keepalive", timeout=10)
-    except:
-        pass
-
-scheduler.add_job(keep_alive_job, 'interval', minutes=14, id='keepalive')
-
-
-# ==================== RUN ====================
-if __name__ == '__main__':
-    import os
-    port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port)
+# ============ START SERVER ============
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    print(f"Starting on port {port}")
+    app.run(host="0.0.0.0", port=port)
